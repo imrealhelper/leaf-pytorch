@@ -1,69 +1,133 @@
 import torch
-from torch import nn
+import torch.nn as nn
 
 
-class ExponentialMovingAverage(nn.Module):
-    def __init__(self, in_channels, coeff_init, per_channel: bool = False):
-        super(ExponentialMovingAverage, self).__init__()
-        self._coeff_init = coeff_init
-        self._per_channel = per_channel
-        weights = torch.ones(in_channels,) if self._per_channel else torch.ones(1,)
-        self._weights = nn.Parameter(weights * self._coeff_init)
+def _logit(p, eps: float = 1e-6):
+    """Numerically stable logit."""
+    p = torch.as_tensor(p).clamp(eps, 1 - eps)
+    return torch.log(p / (1 - p))
 
-    def forward(self, x):
-        w = torch.clamp(self._weights, min=0., max=1.)
-        initial_state = x[:, :, 0]
 
-        def scan(init_state, x, w):
-            x = x.permute(2, 0, 1)
-            acc = init_state
-            results = []
-            for ix in range(len(x)):
-                acc = (w * x[ix]) + ((1.0 - w) * acc)
-                results.append(acc.unsqueeze(0))
-            results = torch.cat(results, dim=0)
-            results = results.permute(1, 2, 0)
-            return results
-
-        return scan(initial_state, x, w)
+def _softplus_inv(y):
+    """Inverse softplus ensuring numerical stability."""
+    y = torch.as_tensor(y)
+    return torch.log(torch.expm1(y.clamp_min(1e-8)))
 
 
 class PCENLayer(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 alpha: float = 0.96,
-                 smooth_coef: float = 0.04,
-                 delta: float = 2.0,
-                 root: float = 2.0,
-                 floor: float = 1e-6,
-                 trainable: bool = False,
-                 learn_smooth_coef: bool = False,
-                 per_channel_smooth_coef: bool = False):
-        super(PCENLayer, self).__init__()
-        self._alpha_init = alpha
-        self._delta_init = delta
-        self._root_init = root
-        self._smooth_coef = smooth_coef
-        self._floor = floor
-        self._trainable = trainable
-        self._learn_smooth_coef = learn_smooth_coef
-        self._per_channel_smooth_coef = per_channel_smooth_coef
+    """Per-Channel Energy Normalization using cumsum-based EMA.
 
-        self.alpha = nn.Parameter(torch.ones(in_channels) * self._alpha_init)
-        self.delta = nn.Parameter(torch.ones(in_channels) * self._delta_init)
-        self.root = nn.Parameter(torch.ones(in_channels) * self._root_init)
+    This implementation follows the closed-form cumsum formulation to avoid
+    explicit time-step loops. Parameters ``s``, ``alpha``, ``delta`` and ``r``
+    are learned per channel and constrained to sensible ranges using sigmoid
+    or softplus transforms.
 
-        if self._learn_smooth_coef:
-            self.ema = ExponentialMovingAverage(in_channels, coeff_init=self._smooth_coef,
-                                                per_channel=self._per_channel_smooth_coef)
+    Args:
+        in_channels: Number of input channels.
+        alpha: Exponent for the EMA denominator.
+        smooth_coef: Smoothing coefficient ``s`` of the EMA.
+        delta: Bias added before the power ``r``.
+        root: Inverse of the exponent ``r`` (``r = 1/root``).
+        floor: Epsilon added inside the denominator for stability.
+        trainable: If ``False`` parameters are frozen.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        alpha: float = 0.96,
+        smooth_coef: float = 0.04,
+        delta: float = 2.0,
+        root: float = 2.0,
+        floor: float = 1e-6,
+        trainable: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.n_channels = in_channels
+        self.eps = float(floor)
+
+        # ``r`` is the exponent in the PCEN formula. ``root`` in the original
+        # implementation corresponds to ``1 / r``.
+        r = 1.0 / float(root)
+
+        # Store raw (unconstrained) params and map to valid ranges in forward.
+        self._s_raw = nn.Parameter(
+            torch.full((in_channels,), _logit(smooth_coef)), requires_grad=trainable
+        )
+        self._alpha_raw = nn.Parameter(
+            torch.full((in_channels,), _logit(alpha)), requires_grad=trainable
+        )
+        self._r_raw = nn.Parameter(
+            torch.full((in_channels,), _logit(r)), requires_grad=trainable
+        )
+        self._delta_raw = nn.Parameter(
+            torch.full((in_channels,), _softplus_inv(delta)), requires_grad=trainable
+        )
+
+        # Bounds kept as buffers so they move with the module's device.
+        self.register_buffer("_zero", torch.tensor(0.0))
+        self.register_buffer("_one", torch.tensor(1.0))
+
+    def _s(self):
+        # map raw -> (0,1)
+        return torch.sigmoid(self._s_raw)
+
+    def _alpha(self):
+        return torch.sigmoid(self._alpha_raw)
+
+    def _r(self):
+        return torch.sigmoid(self._r_raw)
+
+    def _delta(self):
+        return torch.nn.functional.softplus(self._delta_raw)
+
+    def forward(self, x: torch.Tensor, return_m: bool = False):
+        """Compute PCEN.
+
+        Args:
+            x: Input tensor of shape ``(B, C, T)``.
+            return_m: If ``True`` also return the computed EMA ``M``.
+        Returns:
+            Tensor of shape ``(B, C, T)`` (and optionally ``M``).
+        """
+
+        assert (
+            x.dim() == 3 and x.size(1) == self.n_channels
+        ), "Input must be of shape (B, C, T)"
+        E = x.transpose(1, 2)  # (B, T, C)
+        B, T, C = E.shape
+
+        s = self._s()
+        a = 1.0 - s
+        alpha = self._alpha()
+        delta = self._delta()
+        r = self._r()
+
+        if T == 0:
+            return (x, x) if return_m else x
+
+        # Initial M_0 uses E_0 for stability.
+        M0 = E[:, 0, :]
+
+        if T == 1:
+            M = M0[:, None, :]
         else:
-            raise ValueError("SimpleRNN based ema not implemented.")
+            powers = torch.arange(1, T, device=E.device, dtype=E.dtype).unsqueeze(1)
+            pow_seq = a.pow(powers)
+            invpow_seq = a.pow(-powers)
+            E_rest = E[:, 1:, :]
+            R = s.view(1, 1, C) * invpow_seq.view(1, T - 1, C) * E_rest
+            Csum = torch.cumsum(R, dim=1)
+            M_tail = pow_seq.view(1, T - 1, C) * (M0.view(B, 1, C) + Csum)
+            M = torch.cat([M0.view(B, 1, C), M_tail], dim=1)
 
-    def forward(self, x):
-        alpha = torch.min(self.alpha, torch.tensor(1.0, dtype=x.dtype, device=x.device))
-        root = torch.max(self.root, torch.tensor(1.0, dtype=x.dtype, device=x.device))
-        ema_smoother = self.ema(x)
-        one_over_root = 1. / root
-        output = ((x / (self._floor + ema_smoother) ** alpha.view(1, -1, 1) + self.delta.view(1, -1, 1))
-                  ** one_over_root.view(1, -1, 1) - self.delta.view(1, -1, 1) ** one_over_root.view(1, -1, 1))
-        return output
+        denom = (self.eps + M).pow(alpha.view(1, 1, C))
+        pcen = (
+            (E / denom + delta.view(1, 1, C)).pow(r.view(1, 1, C))
+            - delta.view(1, 1, C).pow(r.view(1, 1, C))
+        )
+        pcen = pcen.transpose(1, 2)  # (B, C, T)
+        M = M.transpose(1, 2)  # (B, C, T)
+        return (pcen, M) if return_m else pcen
+
